@@ -2,16 +2,23 @@
 from __future__ import annotations
 import copy
 import functools
-import hashlib
 import inspect
-import json
 from typing import Any, Callable
 
 from . import hooks as _hooks
 
 
-def _hash(tree: Any) -> str:
-    return hashlib.sha256(json.dumps(tree, sort_keys=True, default=str).encode()).hexdigest()
+def _unchanged(old: Any, new: Any) -> bool:
+    """Whether new says the same as old, erring towards "changed".
+
+    Exotic values (ndarray and friends) return something that is not a bool
+    from ==; those are reported as changed rather than guessed at, the same way
+    _deps_changed treats them.
+    """
+    try:
+        return bool(old == new)
+    except Exception:
+        return False
 
 
 def _is_async(fn: Any) -> bool:
@@ -79,7 +86,6 @@ class Layout:
         self.strict = strict
         self.registry: dict[str, Callable] = {}
         self._last_tree: Any = None
-        self._last_hash: str | None = None
         self._slots: dict[str, Any] = {}
         self._hooks: dict = {}
         self._hooks_seen: dict = {}
@@ -183,13 +189,19 @@ class Layout:
                 self._check_allowlist(c)
 
     def diff_and_commit(self, tree: dict) -> list[dict]:
-        h = _hash(tree)
-        if h == self._last_hash:
+        """Ops for what changed, or [] when nothing did.
+
+        The gate is a compare, not a digest. The previous tree has to be kept
+        anyway to diff against, so comparing it outright costs less than
+        serialising and hashing it -- and it cannot collide, which a digest
+        over json.dumps(default=str) can: two values that stringify alike
+        hashed alike and the update was silently dropped.
+        """
+        if self._last_tree is not None and _unchanged(self._last_tree, tree):
             return []
         old = self._last_tree if self._last_tree is not None else {}
         ops = _diff(old, tree, path="")
         self._last_tree = copy.deepcopy(tree)
-        self._last_hash = h
         return ops
 
     def tick(self, state: Any, version: Any = None) -> list[dict]:
@@ -213,7 +225,6 @@ class Layout:
         """
         tree = self.render(state)
         self._last_tree = copy.deepcopy(tree)
-        self._last_hash = _hash(tree)
         return {"chan": "ui", "type": "snapshot", "seq": seq, "tree": tree}
 
     def dispatch(self, handler_id: str, state: Any, event: Any = None) -> None:
@@ -255,9 +266,12 @@ class Layout:
         return res
 
     def set_slot(self, name: str, value: Any) -> dict | None:
-        """Hot path bypassing the diff: unchanged values return None."""
-        h = _hash(value)
-        if self._slots.get(name, {}).get("hash") == h:
+        """Hot path bypassing the diff: unchanged values return None.
+
+        Compared, not hashed, for the same reason as the tree: the last value
+        is kept regardless, so the digest bought nothing and could collide.
+        """
+        if name in self._slots and _unchanged(self._slots[name], value):
             return None
-        self._slots[name] = {"hash": h, "value": value}
+        self._slots[name] = value
         return {"chan": "ui", "type": "slot", "name": name, "value": value}
