@@ -1,3 +1,9 @@
+#  Release via CI: bump `version` in pyproject.toml, commit, then
+#    `git tag vX.Y.Z && git push origin vX.Y.Z` -> watch Actions -> publish.
+#  Manual escape hatch: `uv build`, then
+#    `UV_PUBLISH_TOKEN=<pypi-token> uv publish dist/*`
+#  Do NOT push a tag for a version already uploaded manually:
+#  the job would fail trying to re-upload it. Tag the next version instead.
 name: publish
 
 on:
