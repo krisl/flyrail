@@ -10,10 +10,14 @@ it, your tick drives it.
 owns form rendering but not arbitrary layouts. flyrail splits the problem:
 
 - **Python** (`flyrail/`): declarative element helpers, per-session handler
-  registry, hash-gated diffing, slot fast-path. Zero dependencies.
+  registry, per-component memoisation, gated keyed-list diffing, slot
+  fast-path. Zero dependencies.
 - **JS** (`js/`, `flyrail-renderer`): namespace component registry
   (`import * as MUI`), patch applier, client store with resync, debounced
   inputs. Zero dependencies (React is a peer).
+
+See [docs/features.md](docs/features.md) for what each capability buys you,
+with a runnable example each.
 
 ## Message flow
 
