@@ -6,13 +6,29 @@ Rules (React's, enforced by convention + loud errors):
 - never call hooks outside a @component body;
 - give repeated components distinct key= values.
 
-Renders are assumed serial (one tick loop / one async loop per Layout);
-concurrent renders from multiple threads are not supported.
+Renders are serial per Layout. Two Layouts on two threads are fine: the frame
+stack is thread-local, so neither can see the other's hook slots.
 """
 from __future__ import annotations
+import threading
 from typing import Any, Callable
 
-_active: list = []  # stack of _Frame; innermost last
+
+class _Stack(threading.local):
+    """Frame stack, innermost last, private to the thread that renders.
+
+    One Layout renders serially, but a host with more than one Layout may well
+    drive them from different threads -- a tick loop per session is an ordinary
+    shape. A module-global stack lets those renders interleave and hands a
+    component another component's slots, which surfaces later as impossible
+    state rather than as an error.
+    """
+
+    def __init__(self):
+        self.frames: list = []
+
+
+_stack = _Stack()
 
 
 class _Frame:
@@ -26,20 +42,20 @@ class _Frame:
 
 def enter(slots: list, schedule: Callable[[], None]) -> _Frame:
     frame = _Frame(slots, schedule)
-    _active.append(frame)
+    _stack.frames.append(frame)
     return frame
 
 
 def exit() -> None:
-    if not _active:
+    if not _stack.frames:
         raise RuntimeError("hook frames unbalanced (concurrent renders?)")
-    _active.pop()
+    _stack.frames.pop()
 
 
 def _frame() -> _Frame:
-    if not _active:
+    if not _stack.frames:
         raise RuntimeError("hooks may only be called inside a @component body")
-    return _active[-1]
+    return _stack.frames[-1]
 
 
 def use_state(initial: Any = None):
