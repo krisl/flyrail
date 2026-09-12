@@ -186,6 +186,10 @@ class Layout:
         self.strict = strict
         self.registry: dict[str, Callable] = {}
         self._last_tree: Any = None
+        #: The committed tree as rendered, not the defensive copy, so an
+        #: unchanged render can be recognised by identity before anything is
+        #: compared element by element.
+        self._last_source: Any = None
         self._slots: dict[str, Any] = {}
         self._hooks: dict = {}
         self._hooks_seen: dict = {}
@@ -196,6 +200,15 @@ class Layout:
         #: Slots expanded beneath each slot last render, so a component can ask
         #: whether anything under it went stale, not just itself.
         self._subtree: dict = {}
+        #: Per-slot serialized form: slot_id -> (expanded, path, tree, handlers).
+        #: Keyed on the expanded object and the path it was serialized at, both
+        #: of which have to still hold for the cached tree to be the right
+        #: answer -- handler ids are built from the path.
+        self._serial: dict = {}
+        #: id(expanded subtree) -> slot_id, for the slots currently memoised.
+        #: Rebuilt each render; the objects are held alive by _memo, so their
+        #: ids cannot be recycled underneath it.
+        self._memo_root_by_id: dict = {}
         self._expanding: list = []
         self._dirty_slots: set = set()
         #: Slots in the order they finished expanding, which is children before
@@ -224,6 +237,7 @@ class Layout:
         them. For a host that mutates state components read without being
         handed it, and for bisecting a suspected @pure that is not."""
         self._memo.clear()
+        self._serial.clear()
 
     def _invalidate_slot(self, slot_id: Any) -> None:
         """A hook in this component set new state: only it needs re-running."""
@@ -248,6 +262,8 @@ class Layout:
         self._hooks_seen = {}
         self._hooks_visited = set()
         self._effect_order = []
+        self._memo_root_by_id = {id(entry[2]): slot_id
+                                 for slot_id, entry in self._memo.items()}
         expanded = self._expand(self.render_fn(state))
         for k in list(self._hooks):
             if k not in self._hooks_visited:
@@ -258,10 +274,18 @@ class Layout:
                 # An unmounted component must not leave a memo behind: the same
                 # slot_id can be handed to a later instance, which would then
                 # start from the old instance's subtree.
-                self._memo.pop(k, None)
+                stale = self._memo.pop(k, None)
+                if stale is not None:
+                    # Dropping the last reference to that subtree frees it, and
+                    # a later allocation can be handed the same id. Forget the
+                    # mapping rather than let an unrelated node match it.
+                    self._memo_root_by_id.pop(id(stale[2]), None)
+                self._serial.pop(k, None)
                 self._subtree.pop(k, None)
                 self._dirty_slots.discard(k)
-        tree = self._serialize(expanded, path="0")
+        collected: dict[str, Callable] = {}
+        tree = self._serialize(expanded, path="0", collected=collected)
+        self.registry.update(collected)
         if self.allowed_types:
             self._check_allowlist(tree)
         return tree
@@ -363,6 +387,7 @@ class Layout:
             if self.memo and getattr(fn, "_flyrail_pure", False):
                 self._memo[slot_id] = (node.get("args", ()),
                                        node.get("kwargs", {}), result)
+                self._memo_root_by_id[id(result)] = slot_id
             return result
         if isinstance(node, dict):
             out = dict(node)
@@ -375,7 +400,35 @@ class Layout:
             return [self._expand(c, f"{path}.{i}") for i, c in enumerate(node)]
         return node
 
-    def _serialize(self, node: Any, path: str) -> Any:
+    def _serialize(self, node: Any, path: str, collected: dict) -> Any:
+        """Serialize a subtree, reusing the last result at a memoised root.
+
+        Serialization rebuilds every node carrying a handler, so a subtree that
+        _expand handed back untouched still came out as fresh objects and the
+        tree was never identical twice. At a memoised root the answer is
+        already known: same expanded input, same path, same output. The path
+        has to match because handler ids are built from it.
+
+        The registry is still rebuilt from scratch every render -- the ids have
+        to stay resolvable -- so a cache hit replays the subtree's
+        registrations rather than skipping them.
+        """
+        slot_id = self._memo_root_by_id.get(id(node)) if isinstance(node, dict) else None
+        if slot_id is None:
+            return self._serialize_node(node, path, collected)
+
+        cached = self._serial.get(slot_id)
+        if cached is not None and cached[0] is node and cached[1] == path:
+            collected.update(cached[3])
+            return cached[2]
+
+        own: dict[str, Callable] = {}
+        out = self._serialize_node(node, path, own)
+        self._serial[slot_id] = (node, path, out, own)
+        collected.update(own)
+        return out
+
+    def _serialize_node(self, node: Any, path: str, collected: dict) -> Any:
         """Swap callables for {"handlerId": ...}, returning a new node only
         where something actually changed.
 
@@ -396,7 +449,7 @@ class Layout:
                 # The path is built from keys where children have them, so a
                 # widget keeps its id when its siblings move around it.
                 hid = f"{path}:{evt}:{key}"
-                self.registry[hid] = fn
+                collected[hid] = fn
                 replaced[evt] = {"handlerId": hid,
                                  **{**EVENT_DEFAULTS,
                                     **node.get("event_options", {}).get(evt, {})}}
@@ -404,7 +457,7 @@ class Layout:
         children = node.get("children")
         serialized_children = None
         if isinstance(children, list):
-            walked = [self._serialize(child, f"{path}.{_segment(child, i)}")
+            walked = [self._serialize(child, f"{path}.{_segment(child, i)}", collected)
                       for i, child in enumerate(children)]
             if any(a is not b for a, b in zip(walked, children)):
                 serialized_children = walked
@@ -429,17 +482,22 @@ class Layout:
     def diff_and_commit(self, tree: dict) -> list[dict]:
         """Ops for what changed, or [] when nothing did.
 
-        The gate is a compare, not a digest. The previous tree has to be kept
-        anyway to diff against, so comparing it outright costs less than
-        serialising and hashing it -- and it cannot collide, which a digest
-        over json.dumps(default=str) can: two values that stringify alike
-        hashed alike and the update was silently dropped.
+        Three gates, cheapest first. A memoised render hands back the very
+        same tree object, so identity settles it outright. Otherwise the
+        previous tree has to be kept anyway to diff against, so comparing it is
+        cheaper than serialising and hashing it -- and cannot collide, which a
+        digest over json.dumps(default=str) can: two values that stringify
+        alike hashed alike and the update was silently dropped.
         """
+        if tree is self._last_source:
+            return []
         if self._last_tree is not None and _unchanged(self._last_tree, tree):
+            self._last_source = tree
             return []
         old = self._last_tree if self._last_tree is not None else {}
         ops = _diff(old, tree, path="", keyed_lists=self.keyed_lists)
         self._last_tree = copy.deepcopy(tree)
+        self._last_source = tree
         return ops
 
     def tick(self, state: Any, version: Any = None) -> list[dict]:
@@ -463,6 +521,7 @@ class Layout:
         """
         tree = self.render(state)
         self._last_tree = copy.deepcopy(tree)
+        self._last_source = tree
         return {"chan": "ui", "type": "snapshot", "seq": seq, "tree": tree}
 
     def dispatch(self, handler_id: str, state: Any, event: Any = None) -> None:
