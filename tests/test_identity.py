@@ -17,8 +17,13 @@ def Row(index, label, selected):
 
 @component
 @pure
-def Board(picked):
-    return Stack(*[Row(i, f"Row {i}", picked == i, key=i) for i in range(6)])
+def Board(spec):
+    """Takes either a picked index, or an (ids, picked) pair for churn tests."""
+    if isinstance(spec, tuple):
+        ids, picked = spec
+    else:
+        ids, picked = range(6), spec
+    return Stack(*[Row(i, f"Row {i}", picked == i, key=i) for i in ids])
 
 
 class IdentityTest(unittest.TestCase):
@@ -218,3 +223,31 @@ class IdentityTest(unittest.TestCase):
         layout.render(False)
 
         self.assertEqual(layout._serial, {})
+
+
+class CacheCoherenceTest(unittest.TestCase):
+    """The serialize cache must never disagree with a render that has no cache.
+
+    Mount, unmount, reorder and state change all move what is cached and at
+    which path; a fixed seed keeps the sequence reproducible when it fails.
+    """
+
+    def test_randomised_churn_always_matches_a_from_scratch_render(self):
+        import random
+
+        random.seed(7)
+        layout = Layout(Board)
+
+        for step in range(400):
+            ids = tuple(sorted(random.sample(range(6), random.randint(0, 6))))
+            picked = random.choice([-1, *ids]) if ids else -1
+            spec = (ids, picked)
+
+            tree = layout.render(spec)
+
+            self.assertEqual(tree, Layout(Board).render(spec),
+                             f"step {step}: cached render diverged for {spec}")
+            for row in tree.get("children", []):
+                handler_id = row["children"][1]["on_click"]["handlerId"]
+                self.assertIn(handler_id, layout.registry,
+                              f"step {step}: {handler_id} stopped resolving")
