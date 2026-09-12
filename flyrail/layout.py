@@ -47,12 +47,82 @@ def _escape(path: str) -> str:
 EVENT_DEFAULTS = {"preventDefault": True, "stopPropagation": False}
 
 
-def _diff(old: Any, new: Any, path: str = "") -> list[dict]:
-    """Minimal RFC6902 diff. Dicts recurse; lists replace wholesale (React
-    reconciles arrays via `key` client-side, so index patches would be waste).
-    Hot per-tick values bypass this entirely via Slots (next commit)."""
+def _keys_of(items: list) -> list | None:
+    """The list's element keys, or None if it is not keyed throughout.
+
+    Reconciling by key needs every element to be a keyed dict with keys unique
+    within the list; anything else and position is all there is to go on.
+    Unhashable keys (a list as a key) cannot be reconciled either -- they
+    fall back to replacing, rather than raising mid-diff.
+    """
+    keys = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        key = item.get("key")
+        if key is None:
+            return None
+        keys.append(key)
+    try:
+        unique = len(set(keys)) == len(keys)
+    except TypeError:
+        return None
+    return keys if unique else None
+
+
+def _diff_keyed_list(old: list, new: list, path: str, keyed_lists: bool) -> list[dict] | None:
+    """Per-element ops for two keyed lists, or None to fall back to a replace.
+
+    Emitted in apply order against a running copy, because RFC6902 array
+    pointers are indices: a remove shifts everything after it, so the ops only
+    mean anything applied in sequence from the same baseline -- which is what
+    the committed tree guarantees.
+    """
+    old_keys, new_keys = _keys_of(old), _keys_of(new)
+    if old_keys is None or new_keys is None:
+        return None
+
     ops: list[dict] = []
-    if old == new:
+    working = list(old)
+    keys = list(old_keys)
+
+    wanted = set(new_keys)
+    for index in range(len(working) - 1, -1, -1):
+        if keys[index] not in wanted:
+            ops.append({"op": "remove", "path": f"{path}/{index}"})
+            del working[index]
+            del keys[index]
+
+    present = set(keys)
+    for index, key in enumerate(new_keys):
+        if key not in present:
+            ops.append({"op": "add", "path": f"{path}/{index}", "value": new[index]})
+            working.insert(index, new[index])
+            keys.insert(index, key)
+            present.add(key)
+
+    if keys != new_keys:
+        # Same elements, different order. RFC6902 has `move`, but the ops this
+        # emits are add/replace/remove, so a reorder is not expressible here;
+        # let the caller replace the list outright rather than emit something
+        # a client cannot apply.
+        return None
+
+    for index, (before, after) in enumerate(zip(working, new)):
+        ops.extend(_diff(before, after, f"{path}/{index}", keyed_lists))
+    return ops
+
+
+def _diff(old: Any, new: Any, path: str = "", keyed_lists: bool = True) -> list[dict]:
+    """Minimal RFC6902 diff. Dicts recurse; keyed lists reconcile by key.
+
+    Lists used to replace wholesale, on the reasoning that a client reconciles
+    arrays by `key` anyway. That is true of the DOM and irrelevant to the wire:
+    the whole list has already crossed the socket by the time the client
+    reconciles it, so one changed label re-sent every sibling it had.
+    """
+    ops: list[dict] = []
+    if _unchanged(old, new):
         return ops
     if isinstance(old, dict) and isinstance(new, dict):
         for k in old:
@@ -63,8 +133,12 @@ def _diff(old: Any, new: Any, path: str = "") -> list[dict]:
             if k not in old:
                 ops.append({"op": "add", "path": p, "value": v})
             else:
-                ops.extend(_diff(old[k], v, p))
+                ops.extend(_diff(old[k], v, p, keyed_lists))
         return ops
+    if keyed_lists and isinstance(old, list) and isinstance(new, list):
+        keyed = _diff_keyed_list(old, new, path, keyed_lists)
+        if keyed is not None:
+            return keyed
     return [{"op": "replace", "path": path or "/", "value": new}]
 
 
@@ -80,7 +154,12 @@ class Layout:
     """
 
     def __init__(self, render_fn: Callable[[Any], dict], allowed_types: set[str] | None = None,
-                 strict: bool = False):
+                 strict: bool = False, keyed_lists: bool = True):
+        #: Reconcile keyed lists element by element instead of replacing them
+        #: whole. The ops stay within add/replace/remove, and the bundled
+        #: client applies array pointers already, so this is on by default.
+        #: Turn it off for a client that only understands object pointers.
+        self.keyed_lists = keyed_lists
         self.render_fn = render_fn
         self.allowed_types = allowed_types
         self.strict = strict
@@ -225,7 +304,7 @@ class Layout:
         if self._last_tree is not None and _unchanged(self._last_tree, tree):
             return []
         old = self._last_tree if self._last_tree is not None else {}
-        ops = _diff(old, tree, path="")
+        ops = _diff(old, tree, path="", keyed_lists=self.keyed_lists)
         self._last_tree = copy.deepcopy(tree)
         return ops
 
