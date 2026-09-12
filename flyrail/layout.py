@@ -1,6 +1,7 @@
 """Transport-agnostic layout: handler registry, wire serialization, diffing."""
 from __future__ import annotations
 import copy
+import functools
 import hashlib
 import inspect
 import json
@@ -11,6 +12,21 @@ from . import hooks as _hooks
 
 def _hash(tree: Any) -> str:
     return hashlib.sha256(json.dumps(tree, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _is_async(fn: Any) -> bool:
+    """Whether calling fn starts a coroutine, without calling it.
+
+    functools.partial and callable objects wrap the real function, so unwrap
+    before asking; otherwise a partial around an async def reads as sync.
+    """
+    target = fn
+    while isinstance(target, functools.partial):
+        target = target.func
+    if inspect.iscoroutinefunction(target):
+        return True
+    call = getattr(target, "__call__", None)
+    return call is not None and inspect.iscoroutinefunction(call)
 
 
 def _escape(path: str) -> str:
@@ -201,16 +217,31 @@ class Layout:
         return {"chan": "ui", "type": "snapshot", "seq": seq, "tree": tree}
 
     def dispatch(self, handler_id: str, state: Any, event: Any = None) -> None:
+        """Run a sync handler; refuse an async one.
+
+        Two different author mistakes used to give the same message. A handler
+        that *is* async is caught on the function, before a throwaway coroutine
+        is built; a sync handler that *returns* an awaitable can only be caught
+        after calling it, and its synchronous part has necessarily already run.
+        Saying which happened is the difference between "use adispatch" and
+        "you have a half-applied handler".
+        """
         fn = self.registry.get(handler_id)
         if fn is None:
             raise KeyError(f"unknown handler {handler_id!r}")
-        res = fn(state, event)
-        if inspect.isawaitable(res):
-            if inspect.iscoroutine(res):
-                res.close()
+        if _is_async(fn):
             raise RuntimeError(
                 f"handler {handler_id!r} is async; use await adispatch() "
                 "instead of dispatch()")
+        res = fn(state, event)
+        if inspect.isawaitable(res):
+            # A sync function that returns an awaitable: nothing of the
+            # awaitable has run, so closing it really does cancel it.
+            if inspect.iscoroutine(res):
+                res.close()
+            raise RuntimeError(
+                f"handler {handler_id!r} returned an awaitable; use await "
+                "adispatch() instead of dispatch()")
 
     async def adispatch(self, handler_id: str, state: Any, event: Any = None) -> Any:
         """Dispatch both sync and async handlers; awaits awaitables.
