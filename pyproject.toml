@@ -2,8 +2,22 @@
 name = "flyrail"
 version = "0.1.0"
 description = "Bring-your-own-frontend server-driven UI core (reactpy-style API, transport agnostic)"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Aaron Lipinski", email = "kris.lipinski@gmail.com" }]
+keywords = ["ui", "server-driven-ui", "websocket", "asgi"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Framework :: AsyncIO",
+  "Topic :: Internet :: WWW/HTTP",
+  "Typing :: Typed",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/krisl/flyrail"
+Repository = "https://github.com/krisl/flyrail"
 
 [build-system]
 requires = ["setuptools>=61"]
