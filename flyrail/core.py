@@ -25,11 +25,19 @@ def pure(fn=None):
     """Opt-in contract: output is a pure function of (arguments, hook slots).
 
     Declares, not verifies: Layout may skip re-renders when the host version
-    is unchanged, and strict mode double-renders to spot-check. Unmarked
-    renders always re-render. If you lie, the stale UI is your bug.
+    is unchanged or when a component's arguments are unchanged, and strict mode
+    double-renders to spot-check. Unmarked renders always re-render. If you lie,
+    the stale UI is your bug.
+
+    Marks both sides of @component so either decorator order works: Layout
+    expands the inner function, while a host reading the flag off the name it
+    was given sees the wrapper.
     """
     def wrap(f):
         f._flyrail_pure = True
+        inner = getattr(f, "_component_fn", None)
+        if inner is not None:
+            inner._flyrail_pure = True
         return f
     return wrap(fn) if fn else wrap
 

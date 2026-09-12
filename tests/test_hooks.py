@@ -162,3 +162,215 @@ class ThreadIsolationTest(unittest.TestCase):
 
         self.assertNotIn('leaked', escaped)
         self.assertIn('inside a @component body', escaped['error'])
+
+
+class ComponentMemoTest(unittest.TestCase):
+    def test_a_pure_component_with_unchanged_arguments_is_not_re_run(self):
+        from flyrail import Layout, component, pure, use_state
+
+        runs = []
+
+        @component
+        @pure
+        def Row(label):
+            use_state(0)
+            runs.append(label)
+            return Text(label)
+
+        @component
+        def Board(_state):
+            return Stack(*[Row(f'row {i}', key=i) for i in range(4)])
+
+        layout = Layout(Board)
+        layout.render(None)
+        mounted = list(runs)
+        runs.clear()
+
+        layout.render(None)
+        layout.render(None)
+
+        self.assertEqual(len(mounted), 4)
+        self.assertEqual(runs, [], 'unchanged @pure rows should not have re-run')
+
+    def test_a_changed_argument_re_runs_only_that_component(self):
+        from flyrail import Layout, component, pure
+
+        runs = []
+        picked = {'index': -1}
+
+        @component
+        @pure
+        def Row(label, selected):
+            runs.append(label)
+            return Text(f'{label}{"*" if selected else ""}')
+
+        @component
+        def Board(_state):
+            return Stack(*[Row(f'row {i}', picked['index'] == i, key=i) for i in range(4)])
+
+        layout = Layout(Board)
+        layout.render(None)
+        runs.clear()
+
+        picked['index'] = 2
+        layout.render(None)
+
+        self.assertEqual(runs, ['row 2'])
+
+    def test_set_state_re_runs_only_the_component_that_owns_it(self):
+        from flyrail import Layout, component, pure, use_state
+
+        runs = []
+        setters = {}
+
+        @component
+        @pure
+        def Row(label):
+            value, set_value = use_state(0)
+            setters[label] = set_value
+            runs.append(label)
+            return Text(f'{label}={value}')
+
+        @component
+        def Board(_state):
+            return Stack(*[Row(f'row {i}', key=i) for i in range(4)])
+
+        layout = Layout(Board)
+        layout.render(None)
+        runs.clear()
+
+        setters['row 1'](5)
+        layout.render(None)
+
+        self.assertEqual(runs, ['row 1'])
+
+    def test_an_unmarked_component_always_re_runs(self):
+        """Correct by default: only @pure opts into being skipped."""
+        from flyrail import Layout, component
+
+        runs = []
+
+        @component
+        def Row(label):
+            runs.append(label)
+            return Text(label)
+
+        layout = Layout(lambda state: Stack(Row('a', key='a')))
+        layout.render(None)
+        layout.render(None)
+
+        self.assertEqual(runs, ['a', 'a'])
+
+    def test_memo_can_be_turned_off(self):
+        from flyrail import Layout, component, pure
+
+        runs = []
+
+        @component
+        @pure
+        def Row(label):
+            runs.append(label)
+            return Text(label)
+
+        layout = Layout(lambda state: Stack(Row('a', key='a')), memo=False)
+        layout.render(None)
+        layout.render(None)
+
+        self.assertEqual(runs, ['a', 'a'])
+
+    def test_pure_works_whichever_way_round_the_decorators_go(self):
+        from flyrail import Layout, component, pure
+
+        runs = []
+
+        @pure
+        @component
+        def Row(label):
+            runs.append(label)
+            return Text(label)
+
+        layout = Layout(lambda state: Stack(Row('a', key='a')))
+        layout.render(None)
+        layout.render(None)
+
+        self.assertEqual(runs, ['a'])
+
+
+class MemoLifecycleTest(unittest.TestCase):
+    def test_a_reused_subtree_keeps_its_hook_state(self):
+        """The prune deletes slots it did not see. A skipped subtree is never
+        walked, so it has to report itself as still mounted or it silently
+        restarts from its initial state."""
+        from flyrail import Layout, component, pure, use_state
+
+        seen = []
+        setters = {}
+
+        @component
+        @pure
+        def Inner(_label):
+            value, set_value = use_state('initial')
+            setters['inner'] = set_value
+            seen.append(value)
+            return Text(value)
+
+        @component
+        @pure
+        def Outer(label):
+            return Stack(Inner(label, key='inner'))
+
+        layout = Layout(lambda state: Stack(Outer('x', key='outer')))
+        layout.render(None)
+        setters['inner']('changed')
+        layout.render(None)
+        seen.clear()
+
+        # Outer is reusable now; Inner must not have been collected under it.
+        layout.render(None)
+        setters['inner']('changed again')
+        layout.render(None)
+
+        self.assertEqual(seen, ['changed again'], f'hook state was lost: {seen}')
+
+    def test_invalidate_per_tick_does_not_defeat_the_memo(self):
+        """Driver documents invalidate() per tick for tick hosts. If that dropped
+        the memo, memoisation would never survive a tick."""
+        from flyrail import Layout, component, pure
+
+        runs = []
+
+        @component
+        @pure
+        def Row(label):
+            runs.append(label)
+            return Text(label)
+
+        layout = Layout(lambda state: Stack(Row('a', key='a')))
+        layout.render(None)
+        runs.clear()
+
+        for _ in range(5):
+            layout.invalidate()
+            layout.tick(None)
+
+        self.assertEqual(runs, [])
+
+    def test_reset_forces_every_component_to_run_again(self):
+        from flyrail import Layout, component, pure
+
+        runs = []
+
+        @component
+        @pure
+        def Row(label):
+            runs.append(label)
+            return Text(label)
+
+        layout = Layout(lambda state: Stack(Row('a', key='a')))
+        layout.render(None)
+        runs.clear()
+
+        layout.reset()
+        layout.render(None)
+
+        self.assertEqual(runs, ['a'])

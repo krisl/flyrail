@@ -154,12 +154,19 @@ class Layout:
     """
 
     def __init__(self, render_fn: Callable[[Any], dict], allowed_types: set[str] | None = None,
-                 strict: bool = False, keyed_lists: bool = True):
+                 strict: bool = False, keyed_lists: bool = True,
+                 memo: bool = True):
         #: Reconcile keyed lists element by element instead of replacing them
         #: whole. The ops stay within add/replace/remove, and the bundled
         #: client applies array pointers already, so this is on by default.
         #: Turn it off for a client that only understands object pointers.
         self.keyed_lists = keyed_lists
+        #: Skip re-running a @pure component whose arguments are unchanged and
+        #: nothing under which went stale. Only @pure components are eligible,
+        #: so an unmarked component still re-renders every time. Off turns the
+        #: whole thing back into an unconditional render, which is what you
+        #: want when a stale panel has you suspecting a lying @pure.
+        self.memo = memo
         self.render_fn = render_fn
         self.allowed_types = allowed_types
         self.strict = strict
@@ -170,13 +177,41 @@ class Layout:
         self._hooks_seen: dict = {}
         self._hooks_visited: set = set()
         self._hooks_arity: dict = {}
+        #: Per-slot memo: slot_id -> (args, kwargs, expanded subtree).
+        self._memo: dict = {}
+        #: Slots expanded beneath each slot last render, so a component can ask
+        #: whether anything under it went stale, not just itself.
+        self._subtree: dict = {}
+        self._expanding: list = []
+        self._dirty_slots: set = set()
         self._version: Any = None
         self._dirty = True
 
     def invalidate(self) -> None:
         """Mark dirty: the next tick() re-renders regardless of version.
-        Scheduling seam for hook dispatch and the future Driver."""
+        Scheduling seam for hook dispatch and the Driver.
+
+        Deliberately does not drop memoised subtrees. Driver documents
+        invalidate() per tick for tick hosts, so clearing here would mean the
+        memo never survives a tick and buys nothing for the main use case.
+        Host state reaches a component through its arguments, which the memo
+        compares, so anything the host actually changed re-renders on that
+        basis. A @pure component that reads host state it was not passed is
+        lying, and this is the stale UI the decorator warns about; reach for
+        reset() or memo=False when chasing one.
+        """
         self._dirty = True
+
+    def reset(self) -> None:
+        """Drop every memoised subtree, forcing the next render to run all of
+        them. For a host that mutates state components read without being
+        handed it, and for bisecting a suspected @pure that is not."""
+        self._memo.clear()
+
+    def _invalidate_slot(self, slot_id: Any) -> None:
+        """A hook in this component set new state: only it needs re-running."""
+        self._dirty = True
+        self._dirty_slots.add(slot_id)
 
     def render(self, state: Any) -> dict:
         self.registry.clear()
@@ -199,10 +234,54 @@ class Layout:
             if k not in self._hooks_visited:
                 del self._hooks[k]
                 self._hooks_arity.pop(k, None)
+                # An unmounted component must not leave a memo behind: the same
+                # slot_id can be handed to a later instance, which would then
+                # start from the old instance's subtree.
+                self._memo.pop(k, None)
+                self._subtree.pop(k, None)
+                self._dirty_slots.discard(k)
         tree = self._serialize(expanded, path="0")
         if self.allowed_types:
             self._check_allowlist(tree)
         return tree
+
+    def _reusable(self, slot_id: Any, fn: Any, node: dict) -> Any:
+        """The cached subtree for this component, if reusing it is safe.
+
+        Safe means: it was marked @pure, its arguments still compare equal, its
+        own hooks have not been written to, and nothing expanded beneath it has
+        either. Strict mode never reuses -- its whole job is to render twice and
+        compare, which a cache would quietly turn into one render.
+        """
+        if not self.memo or self.strict or not getattr(fn, "_flyrail_pure", False):
+            return None
+        remembered = self._memo.get(slot_id)
+        if remembered is None:
+            return None
+        if slot_id in self._dirty_slots:
+            return None
+        if self._dirty_slots & self._subtree.get(slot_id, frozenset()):
+            return None
+        args, kwargs, result = remembered
+        if not _unchanged(args, node.get("args", ())):
+            return None
+        if not _unchanged(kwargs, node.get("kwargs", {})):
+            return None
+        return result
+
+    def _mark_reused(self, slot_id: Any) -> None:
+        """Report a skipped subtree as still mounted.
+
+        The prune at the end of a render deletes hook state for any slot it did
+        not see. A reused subtree is never walked, so without this its hooks --
+        and every hook under it -- would be collected and the component would
+        silently restart from its initial state on the next real render.
+        """
+        self._hooks_visited.add(slot_id)
+        beneath = self._subtree.get(slot_id, frozenset())
+        self._hooks_visited.update(beneath)
+        for ancestor in self._expanding:
+            self._subtree.setdefault(ancestor, set()).update(beneath)
 
     def _expand(self, node: Any, path: str = "0") -> Any:
         if isinstance(node, dict) and node.get("type") == "__Component__":
@@ -216,20 +295,42 @@ class Layout:
                     f"duplicate component key {key!r} for "
                     f"{getattr(fn, '__name__', fn)}; keys must be unique "
                     "per component within one render")
+            for ancestor in self._expanding:
+                self._subtree.setdefault(ancestor, set()).add(slot_id)
+
+            cached = self._reusable(slot_id, fn, node)
+            if cached is not None:
+                self._mark_reused(slot_id)
+                return cached
+
             slots = self._hooks.setdefault(slot_id, [])
-            frame = _hooks.enter(slots, self.invalidate)
+            self._subtree[slot_id] = set()
+            self._expanding.append(slot_id)
+            frame = _hooks.enter(slots, lambda sid=slot_id: self._invalidate_slot(sid))
             try:
-                expanded = fn(*node.get("args", ()), **node.get("kwargs", {}))
+                try:
+                    expanded = fn(*node.get("args", ()), **node.get("kwargs", {}))
+                finally:
+                    arity_ok = (frame.index == len(slots)
+                                and frame.index == self._hooks_arity.setdefault(slot_id, frame.index))
+                    _hooks.exit()
+                if not arity_ok:
+                    raise RuntimeError(
+                        "hook count changed between renders: call hooks "
+                        "unconditionally in the same order every render")
+                self._hooks_visited.add(slot_id)
+                self._dirty_slots.discard(slot_id)
+                # Stays on the expanding stack across this call: children are
+                # expanded here, and each has to be recorded against every
+                # component above it or an ancestor cannot tell that something
+                # beneath it went stale.
+                result = self._expand(expanded, path)
             finally:
-                arity_ok = (frame.index == len(slots)
-                            and frame.index == self._hooks_arity.setdefault(slot_id, frame.index))
-                _hooks.exit()
-            if not arity_ok:
-                raise RuntimeError(
-                    "hook count changed between renders: call hooks "
-                    "unconditionally in the same order every render")
-            self._hooks_visited.add(slot_id)
-            return self._expand(expanded, path)
+                self._expanding.pop()
+            if self.memo and getattr(fn, "_flyrail_pure", False):
+                self._memo[slot_id] = (node.get("args", ()),
+                                       node.get("kwargs", {}), result)
+            return result
         if isinstance(node, dict):
             out = dict(node)
             children = out.get("children")
