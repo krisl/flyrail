@@ -158,3 +158,23 @@ class UseEffectTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             layout.render(None)
+
+    def test_a_throwing_cleanup_propagates_out_of_render(self):
+        """Cleanup errors are fail-loud: they abort the render (and the tick
+        driving it) instead of being swallowed. Keep cleanups total."""
+        state = {"show": True}
+
+        @component
+        def Fragile(_state):
+            def eff():
+                def cleanup():
+                    raise RuntimeError("cleanup blew up")
+                return cleanup
+            use_effect(eff, [])
+            return Text("x", key="t")
+
+        layout = Layout(lambda s: Stack([Fragile(s, key="f")] if s["show"] else []))
+        layout.tick(state)
+        state["show"] = False
+        with self.assertRaisesRegex(RuntimeError, "cleanup blew up"):
+            layout.tick(state)

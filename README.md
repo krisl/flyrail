@@ -98,7 +98,9 @@ if env := driver.flush(state):
 
 1. **Stable keys, never indexes.** `key=item.id` on every list child, both
    sides: Python handler ids embed the key, React reconciles by it. Reorder
-   without keys = full remount + lost focus.
+   without keys = full remount + lost focus. Keys must be unique among
+   siblings: duplicates share one handler id (last registration wins) and
+   components reject them, plain nodes do not.
 2. **Slots for tick-rate values.** Table rows, labels, progress: `Slot("rows")`
    + `set_slot()` bypass the tree diff. Structure goes through patches (rare),
    values through slots (every tick).
@@ -123,7 +125,8 @@ if env := driver.flush(state):
 10. **Component-local UI state via hooks.** `use_state`/`use_memo` inside
     `@component` bodies keeps collapsed flags and drafts out of tick state;
     setters schedule through `invalidate()`. Distinct `key=` per instance,
-    hooks unconditional and order-stable, or it raises loudly.
+    hooks unconditional and order-stable, or it raises loudly. Effect
+    cleanups that raise abort the render instead of being swallowed.
 11. **Async handlers via `adispatch`.** Handlers may be `async def` (e.g.
     `await db.save()` on click); sync `dispatch` refuses them loudly instead
     of silently dropping the coroutine. Pattern: `await adispatch(...)`,

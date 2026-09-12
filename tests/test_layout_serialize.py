@@ -143,3 +143,18 @@ class StableHandlerIdTest(unittest.TestCase):
         layout.dispatch(target, None, None)
 
         self.assertEqual(hits, ["c"])
+
+    def test_duplicate_plain_keys_share_one_id_last_registration_wins(self):
+        """Keys must be unique among siblings. Nothing enforces that for
+        plain nodes, so pin the outcome: both widgets serialize the same id
+        and the registry keeps the second handler. Do not rely on this."""
+        hits = []
+        layout = Layout(lambda s: Stack(
+            Button("a", on_click=lambda s, e: hits.append("first"), key="dup"),
+            Button("b", on_click=lambda s, e: hits.append("second"), key="dup")))
+        tree = layout.render({})
+        hids = [c["on_click"]["handlerId"] for c in tree["children"]]
+        self.assertEqual(hids[0], hids[1])
+        self.assertEqual(len(layout.registry), 1)
+        layout.dispatch(hids[0], {})
+        self.assertEqual(hits, ["second"])

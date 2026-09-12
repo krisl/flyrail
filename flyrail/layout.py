@@ -42,6 +42,10 @@ def _segment(child: Any, index: int) -> Any:
     Position alone made a handler id move when its siblings did, so a click on
     a row that had shifted up reached whatever now sat where it used to. A key
     is exactly the promise that this element is the same element, so use it.
+
+    Keys must be unique among siblings: duplicates serialize the same id and
+    the registry keeps the last registration. Components reject duplicates;
+    plain nodes do not, so this is a documented must-not rather than a check.
     """
     if isinstance(child, dict):
         key = child.get("key")

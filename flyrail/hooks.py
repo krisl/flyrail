@@ -120,6 +120,9 @@ def use_effect(fn: Callable[[], Any], deps: list | tuple) -> None:
     and an async effect would need a loop and a task per effect; running on the
     commit keeps the ordering obvious (cleanup, then run) and keeps flyrail
     free of asyncio in the render path.
+
+    Fail-loud: a cleanup that raises aborts the render (and the tick driving
+    it) instead of being swallowed. Keep cleanups total.
     """
     frame = _frame()
     i = frame.index
