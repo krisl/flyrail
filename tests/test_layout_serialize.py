@@ -52,3 +52,39 @@ class SerializeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonMutatingSerializeTest(unittest.TestCase):
+    """Serialization rebuilds only the nodes that carry handlers."""
+
+    def test_the_nodes_the_component_returned_are_not_written_through(self):
+        """The old path deep-copied the tree precisely so it could mutate it.
+        Without a copy, mutating would corrupt whatever the component held."""
+        held = Button("go", on_click=lambda state, event: None, key="go")
+        layout = Layout(lambda state: Stack(held))
+
+        layout.render(None)
+
+        self.assertTrue(callable(held["on_click"]),
+                        "the component's own node was rewritten in place")
+
+    def test_a_node_without_handlers_survives_serialization_as_the_same_object(self):
+        text = Text("hello", key="t")
+        layout = Layout(lambda state: Stack(text, Button(
+            "go", on_click=lambda state, event: None, key="go")))
+
+        tree = layout.render(None)
+
+        # Stack and the Button are rebuilt; the Text has nothing to rewrite.
+        self.assertEqual(tree["children"][0]["props"]["value"], "hello")
+        self.assertIsInstance(tree["children"][1]["on_click"], dict)
+
+    def test_handlers_still_reach_the_registry_and_dispatch(self):
+        calls = []
+        layout = Layout(lambda state: Stack(
+            Button("go", on_click=lambda state, event: calls.append("hit"), key="go")))
+
+        tree = layout.render(None)
+        layout.dispatch(tree["children"][0]["on_click"]["handlerId"], None, None)
+
+        self.assertEqual(calls, ["hit"])

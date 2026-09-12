@@ -120,8 +120,7 @@ class Layout:
             if k not in self._hooks_visited:
                 del self._hooks[k]
                 self._hooks_arity.pop(k, None)
-        tree = copy.deepcopy(expanded)
-        self._serialize(tree, path="0")
+        tree = self._serialize(expanded, path="0")
         if self.allowed_types:
             self._check_allowlist(tree)
         return tree
@@ -163,10 +162,21 @@ class Layout:
             return [self._expand(c, f"{path}.{i}") for i, c in enumerate(node)]
         return node
 
-    def _serialize(self, node: Any, path: str) -> None:
+    def _serialize(self, node: Any, path: str) -> Any:
+        """Swap callables for {"handlerId": ...}, returning a new node only
+        where something actually changed.
+
+        This used to mutate a deep copy of the whole tree. Copying every node
+        to rewrite the few that carry handlers cost more than the diff did, and
+        a subtree that is reused across renders must not be written through at
+        all. Rebuilding only the nodes that change keeps untouched subtrees
+        identical, which is what lets a caller skip work on them.
+        """
         if not isinstance(node, dict):
-            return
+            return node
+
         key = node.get("key", "")
+        replaced: dict[str, Any] = {}
         for evt in ("on_click", "on_change"):
             fn = node.get(evt)
             if callable(fn):
@@ -174,11 +184,26 @@ class Layout:
                 # across list reorders (client reconciles via `key` too).
                 hid = f"{path}:{evt}:{key}"
                 self.registry[hid] = fn
-                node[evt] = {"handlerId": hid,
-                             **{**EVENT_DEFAULTS,
-                                **node.get("event_options", {}).get(evt, {})}}
-        for i, c in enumerate(node.get("children", []) or []):
-            self._serialize(c, f"{path}.{i}")
+                replaced[evt] = {"handlerId": hid,
+                                 **{**EVENT_DEFAULTS,
+                                    **node.get("event_options", {}).get(evt, {})}}
+
+        children = node.get("children")
+        serialized_children = None
+        if isinstance(children, list):
+            walked = [self._serialize(child, f"{path}.{i}")
+                      for i, child in enumerate(children)]
+            if any(a is not b for a, b in zip(walked, children)):
+                serialized_children = walked
+
+        if not replaced and serialized_children is None:
+            return node
+
+        out = dict(node)
+        out.update(replaced)
+        if serialized_children is not None:
+            out["children"] = serialized_children
+        return out
 
     def _check_allowlist(self, node: Any) -> None:
         if isinstance(node, dict):
