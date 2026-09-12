@@ -184,6 +184,9 @@ class Layout:
         self._subtree: dict = {}
         self._expanding: list = []
         self._dirty_slots: set = set()
+        #: Slots in the order they finished expanding, which is children before
+        #: parents, so an effect sees its children already committed.
+        self._effect_order: list = []
         self._version: Any = None
         self._dirty = True
 
@@ -223,15 +226,19 @@ class Layout:
                     "render_fn marked @pure produced different trees across "
                     "two immediate renders; remove @pure or eliminate the "
                     "nondeterminism (time, random, counters, unversioned reads)")
+        self._run_effects()
         self._dirty = False
         return tree
 
     def _render_once(self, state: Any) -> dict:
         self._hooks_seen = {}
         self._hooks_visited = set()
+        self._effect_order = []
         expanded = self._expand(self.render_fn(state))
         for k in list(self._hooks):
             if k not in self._hooks_visited:
+                # Leaving the tree: unwind its effects before its state goes.
+                _hooks.run_cleanups(self._hooks[k])
                 del self._hooks[k]
                 self._hooks_arity.pop(k, None)
                 # An unmounted component must not leave a memo behind: the same
@@ -244,6 +251,17 @@ class Layout:
         if self.allowed_types:
             self._check_allowlist(tree)
         return tree
+
+    def _run_effects(self) -> None:
+        """Commit point: effects run once the tree they describe is built.
+
+        A reused subtree scheduled nothing, so nothing of it runs -- which is
+        the behaviour you want and falls out for free.
+        """
+        for slot_id in self._effect_order:
+            slots = self._hooks.get(slot_id)
+            if slots is not None:
+                _hooks.run_effects(slots)
 
     def _reusable(self, slot_id: Any, fn: Any, node: dict) -> Any:
         """The cached subtree for this component, if reusing it is safe.
@@ -327,6 +345,7 @@ class Layout:
                 result = self._expand(expanded, path)
             finally:
                 self._expanding.pop()
+            self._effect_order.append(slot_id)
             if self.memo and getattr(fn, "_flyrail_pure", False):
                 self._memo[slot_id] = (node.get("args", ()),
                                        node.get("kwargs", {}), result)

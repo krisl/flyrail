@@ -108,6 +108,55 @@ def use_memo(fn: Callable[[], Any], deps: list | tuple):
     return cell[2]
 
 
+def use_effect(fn: Callable[[], Any], deps: list | tuple) -> None:
+    """Run fn after the render commits; re-run it when deps change.
+
+    fn may return a cleanup, which runs before the next run of that effect and
+    once more when the component leaves the tree -- which is what makes an
+    effect the right place for anything that has to be undone: a highlight, a
+    subscription, a lock.
+
+    Synchronous, like the rest of these hooks. A tick host has nowhere to await
+    and an async effect would need a loop and a task per effect; running on the
+    commit keeps the ordering obvious (cleanup, then run) and keeps flyrail
+    free of asyncio in the render path.
+    """
+    frame = _frame()
+    i = frame.index
+    frame.index += 1
+    if i >= len(frame.slots):
+        frame.slots.append(["effect", list(deps), None, fn])
+        return
+    cell = frame.slots[i]
+    if cell[0] != "effect":
+        raise RuntimeError(
+            "hook order changed between renders: call hooks unconditionally "
+            "in the same order every render")
+    if _deps_changed(cell[1], deps):
+        cell[1] = list(deps)
+        cell[3] = fn
+
+
+def run_effects(slots: list) -> None:
+    """Run whatever this component's render scheduled, cleaning up first."""
+    for cell in slots:
+        if cell[0] != "effect" or cell[3] is None:
+            continue
+        pending, cell[3] = cell[3], None
+        cleanup, cell[2] = cell[2], None
+        if cleanup is not None:
+            cleanup()
+        cell[2] = pending()
+
+
+def run_cleanups(slots: list) -> None:
+    """Unwind this component's effects, for a component leaving the tree."""
+    for cell in slots:
+        if cell[0] == "effect" and cell[2] is not None:
+            cleanup, cell[2] = cell[2], None
+            cleanup()
+
+
 def _deps_changed(old: list, new: list | tuple) -> bool:
     new = list(new)
     if len(old) != len(new):
