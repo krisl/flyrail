@@ -36,6 +36,20 @@ def _is_async(fn: Any) -> bool:
     return call is not None and inspect.iscoroutinefunction(call)
 
 
+def _segment(child: Any, index: int) -> Any:
+    """What names a child within its parent: its key, or its position.
+
+    Position alone made a handler id move when its siblings did, so a click on
+    a row that had shifted up reached whatever now sat where it used to. A key
+    is exactly the promise that this element is the same element, so use it.
+    """
+    if isinstance(child, dict):
+        key = child.get("key")
+        if key is not None:
+            return key
+    return index
+
+
 def _escape(path: str) -> str:
     return path.replace("~", "~0").replace("/", "~1")
 
@@ -379,8 +393,8 @@ class Layout:
         for evt in ("on_click", "on_change"):
             fn = node.get(evt)
             if callable(fn):
-                # Path keeps ids unique per position; key keeps them stable
-                # across list reorders (client reconciles via `key` too).
+                # The path is built from keys where children have them, so a
+                # widget keeps its id when its siblings move around it.
                 hid = f"{path}:{evt}:{key}"
                 self.registry[hid] = fn
                 replaced[evt] = {"handlerId": hid,
@@ -390,7 +404,7 @@ class Layout:
         children = node.get("children")
         serialized_children = None
         if isinstance(children, list):
-            walked = [self._serialize(child, f"{path}.{i}")
+            walked = [self._serialize(child, f"{path}.{_segment(child, i)}")
                       for i, child in enumerate(children)]
             if any(a is not b for a, b in zip(walked, children)):
                 serialized_children = walked

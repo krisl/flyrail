@@ -18,7 +18,14 @@ class SerializeTest(unittest.TestCase):
     def test_handler_id_embeds_path_and_key(self):
         layout = Layout(lambda s: Stack(Button("A", on_click=lambda s, e: None, key="k1")))
         tree = layout.render({})
-        self.assertEqual(tree["children"][0]["on_click"]["handlerId"], "0.0:on_click:k1")
+        # The path segment is the child's key, not its index, so the id does
+        # not move when siblings do.
+        self.assertEqual(tree["children"][0]["on_click"]["handlerId"], "0.k1:on_click:k1")
+
+    def test_a_keyless_child_still_falls_back_to_its_index(self):
+        layout = Layout(lambda s: Stack(Button("A", on_click=lambda s, e: None)))
+        tree = layout.render({})
+        self.assertEqual(tree["children"][0]["on_click"]["handlerId"], "0.0:on_click:")
 
     def test_registry_cleared_per_render(self):
         layout = Layout(lambda s: Stack(Button("A", on_click=lambda s, e: None)))
@@ -88,3 +95,51 @@ class NonMutatingSerializeTest(unittest.TestCase):
         layout.dispatch(tree["children"][0]["on_click"]["handlerId"], None, None)
 
         self.assertEqual(calls, ["hit"])
+
+
+class StableHandlerIdTest(unittest.TestCase):
+    """A widget keeps its handler id when its siblings move around it."""
+
+    def _rows(self, order):
+        return lambda state: Stack(*[
+            Button(name, on_click=lambda s, e, n=name: None, key=name) for name in order])
+
+    def _ids(self, tree):
+        return {child["key"]: child["on_click"]["handlerId"]
+                for child in tree["children"]}
+
+    def test_reordering_siblings_does_not_move_a_handler_id(self):
+        layout = Layout(self._rows(["a", "b", "c"]))
+        before = self._ids(layout.render(None))
+
+        layout.render_fn = self._rows(["c", "a", "b"])
+        after = self._ids(layout.render(None))
+
+        self.assertEqual(before, after)
+
+    def test_removing_an_earlier_sibling_does_not_move_a_handler_id(self):
+        layout = Layout(self._rows(["a", "b", "c"]))
+        before = self._ids(layout.render(None))
+
+        layout.render_fn = self._rows(["b", "c"])
+        after = self._ids(layout.render(None))
+
+        self.assertEqual(after["b"], before["b"])
+        self.assertEqual(after["c"], before["c"])
+
+    def test_an_id_still_reaches_the_handler_that_widget_owns(self):
+        hits = []
+        rows = lambda state: Stack(*[
+            Button(name, on_click=lambda s, e, n=name: hits.append(n), key=name)
+            for name in state])
+
+        layout = Layout(rows)
+        tree = layout.render(["a", "b", "c"])
+        target = self._ids(tree)["c"]
+
+        # 'c' moves to the front; the id a client already holds must still be
+        # c's handler, not whatever now sits where c used to be.
+        layout.render(["c", "a", "b"])
+        layout.dispatch(target, None, None)
+
+        self.assertEqual(hits, ["c"])
